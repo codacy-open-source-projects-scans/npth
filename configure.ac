@@ -28,7 +28,7 @@ min_automake_version="1.14"
 # See below for the LT versions.
 m4_define([mym4_package],[npth])
 m4_define([mym4_major], [1])
-m4_define([mym4_minor], [7])
+m4_define([mym4_minor], [8])
 
 # To start a new development series, i.e a new major or minor number
 # you need to mark an arbitrary commit before the first beta release
@@ -54,9 +54,9 @@ AC_INIT([mym4_package],[mym4_version],[https://bugs.gnupg.org])
 #   (Interfaces added:			AGE++)
 #   (Interfaces removed:		AGE=0)
 #
-LIBNPTH_LT_CURRENT=1
-LIBNPTH_LT_AGE=1
-LIBNPTH_LT_REVISION=2
+LIBNPTH_LT_CURRENT=2
+LIBNPTH_LT_AGE=2
+LIBNPTH_LT_REVISION=0
 ################################################
 
 AC_SUBST(LIBNPTH_LT_CURRENT)
