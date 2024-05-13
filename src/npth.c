@@ -178,6 +178,18 @@ static int initialized_or_any_threads;
 typedef int (*trylock_func_t) (void *);
 
 #ifndef HAVE_PTHREAD_MUTEX_TIMEDLOCK
+#define REQUIRE_THE_BUSY_WAIT_FOR_IMPLEMENTATION 1
+#endif
+
+#if !HAVE_PTHREAD_RWLOCK_TIMEDRDLOCK && HAVE_PTHREAD_RWLOCK_TRYRDLOCK
+#define REQUIRE_THE_BUSY_WAIT_FOR_IMPLEMENTATION 1
+#endif
+
+#if !HAVE_PTHREAD_RWLOCK_TIMEDWRLOCK && HAVE_PTHREAD_RWLOCK_TRYWRLOCK
+#define REQUIRE_THE_BUSY_WAIT_FOR_IMPLEMENTATION 1
+#endif
+
+#if REQUIRE_THE_BUSY_WAIT_FOR_IMPLEMENTATION
 static int
 busy_wait_for (trylock_func_t trylock, void *lock,
 	       const struct timespec *abstime)
@@ -488,9 +500,11 @@ npth_rwlock_timedrdlock (npth_rwlock_t *rwlock, const struct timespec *abstime)
   ENTER();
 #if HAVE_PTHREAD_RWLOCK_TIMEDRDLOCK
   err = pthread_rwlock_timedrdlock (rwlock, abstime);
-#else
+#elif HAVE_PTHREAD_RWLOCK_TRYRDLOCK
   err = busy_wait_for ((trylock_func_t) pthread_rwlock_tryrdlock, rwlock,
 		       abstime);
+#else
+  err = ENOSYS;
 #endif
   LEAVE();
   return err;
@@ -533,7 +547,7 @@ npth_rwlock_timedwrlock (npth_rwlock_t *rwlock, const struct timespec *abstime)
   ENTER();
 #if HAVE_PTHREAD_RWLOCK_TIMEDWRLOCK
   err = pthread_rwlock_timedwrlock (rwlock, abstime);
-#elif HAVE_PTHREAD_RWLOCK_TRYRDLOCK
+#elif HAVE_PTHREAD_RWLOCK_TRYWRLOCK
   err = busy_wait_for ((trylock_func_t) pthread_rwlock_trywrlock, rwlock,
 		       abstime);
 #else
