@@ -18,11 +18,11 @@
 
 ## Process this file with automake to produce Makefile.in
 
-TESTS = t-mutex t-thread
+TESTS = t-mutex t-thread t-cond
 XFAIL_TESTS =
 
 if HAVE_W32_SYSTEM
-AM_CPPFLAGS = -I$(top_srcdir)/w32
+AM_CPPFLAGS = -I$(top_builddir)/w32
 LDADD = ../w32/libnpth.la $(LIB_CLOCK_GETTIME)
 else
 AM_CPPFLAGS = -I../src

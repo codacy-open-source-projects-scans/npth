@@ -172,8 +172,19 @@ leave_npth (const char *function)
 #define LEAVE() leave_npth(__FUNCTION__)
 
 
+struct dl {
+  struct dl *next;
+  struct dl *prev;
+};
+
 struct npth_impl_s
 {
+  /* Doubly-linked list for the waiter queue in condition
+     variables.  */
+  /* Should be the first member of struct npth_impl_s, so that
+   * casting from the address of l can be the head of struct npth_impl_s.  */
+  struct dl l;
+
   /* Usually there is one ref owned by the thread as long as it is
      running, and one ref for everybody else as long as the thread is
      joinable.  */
@@ -190,11 +201,6 @@ struct npth_impl_s
 
   char name[THREAD_NAME_MAX + 1];
 
-  /* Doubly-linked list for the waiter queue in condition
-     variables.  */
-  npth_impl_t next;
-  npth_impl_t *prev_ptr;
-
   /* The event on which this thread waits when it is queued.  */
   HANDLE event;
 
@@ -203,32 +209,35 @@ struct npth_impl_s
 
 
 static void
-dequeue_thread (npth_impl_t thread)
+dequeue_thread (struct dl *l)
 {
-  /* Unlink the thread from any condition waiter queue.  */
-  if (thread->next)
+  /* Unlink the entry of L from a condition waiter queue.  */
+  struct dl *next = l->next;
+  struct dl *prev = l->prev;
+
+  if (next)
     {
-      thread->next->prev_ptr = thread->prev_ptr;
-      thread->next = NULL;
+      next->prev = prev;
+      l->next = NULL;
     }
-  if (thread->prev_ptr)
+
+  if (prev)
     {
-      *(thread->prev_ptr) = thread->next;
-      thread->prev_ptr = NULL;
+      prev->next = next;
+      l->prev = NULL;
     }
 }
 
 
-/* Enqueue THREAD to come after the thread whose next pointer is
-   prev_ptr.  */
 static void
-enqueue_thread (npth_impl_t thread, npth_impl_t *prev_ptr)
+enqueue_thread (struct dl *l, struct dl *head)
 {
-  if (*prev_ptr)
-    (*prev_ptr)->prev_ptr = &thread->next;
-  thread->prev_ptr = prev_ptr;
-  thread->next = *prev_ptr;
-  *prev_ptr = thread;
+  struct dl *last_entry = head->prev;
+
+  head->prev = l;
+  l->prev = last_entry;
+  l->next = head;
+  last_entry->next = l;
 }
 
 
@@ -264,15 +273,15 @@ new_thread (npth_t *thread_id)
     return errno;
 
   thread->refs = 1;
-  thread->handle = INVALID_HANDLE_VALUE;
+  thread->handle = NULL;
   thread->detached = 0;
   thread->start_routine = NULL;
   thread->start_arg = NULL;
-  thread->next = NULL;
-  thread->prev_ptr = NULL;
+  thread->l.next = NULL;
+  thread->l.prev = NULL;
   /* We create the event when it is first needed (not all threads wait
      on conditions).  */
-  thread->event = INVALID_HANDLE_VALUE;
+  thread->event = NULL;
   memset (thread->name, '\0', sizeof (thread->name));
 
   thread_table[id] = thread;
@@ -290,8 +299,11 @@ free_thread (npth_t thread_id)
   if (thread->handle)
     CloseHandle (thread->handle);
 
+  if (thread->event)
+    CloseHandle (thread->event);
+
   /* Unlink the thread from any condition waiter queue.  */
-  dequeue_thread (thread);
+  dequeue_thread (&thread->l);
 
   free (thread);
 
@@ -965,7 +977,7 @@ struct npth_cond_s
      simple.  */
 
   /* The waiter queue.  */
-  npth_impl_t waiter;
+  struct dl waiter;
 };
 
 
@@ -983,7 +995,7 @@ npth_cond_init (npth_cond_t *cond_r,
   if (!cond)
     return errno;
 
-  cond->waiter = NULL;
+  cond->waiter.next = cond->waiter.prev = &cond->waiter;
 
   *cond_r = cond;
   return 0;
@@ -996,7 +1008,7 @@ npth_cond_destroy (npth_cond_t *cond)
   if (*cond == 0)
     return EINVAL;
 
-  if ((*cond)->waiter)
+  if ((*cond)->waiter.next != &(*cond)->waiter)
     return EBUSY;
 
   free (*cond);
@@ -1034,18 +1046,20 @@ npth_cond_signal (npth_cond_t *cond)
   int err;
   npth_impl_t thread;
   DWORD res;
+  struct dl *waiter;
 
   /* While we are protected, let's check for a static initializer.  */
   err = cond_init_check (cond);
   if (err)
     return err;
 
-  if ((*cond)->waiter == INVALID_THREAD_ID)
+  waiter = (*cond)->waiter.next;
+  if (waiter == &(*cond)->waiter)
     return 0;
 
   /* Dequeue the first thread and wake it up.  */
-  thread = (*cond)->waiter;
-  dequeue_thread (thread);
+  dequeue_thread (waiter);
+  thread = (struct npth_impl_s *)waiter;
 
   res = SetEvent (thread->event);
   if (res == 0)
@@ -1072,25 +1086,26 @@ npth_cond_broadcast (npth_cond_t *cond)
   int err;
   npth_impl_t thread;
   DWORD res;
+  struct dl *waiter;
 
   /* While we are protected, let's check for a static initializer.  */
   err = cond_init_check (cond);
   if (err)
     return err;
 
-  if ((*cond)->waiter == INVALID_THREAD_ID)
-    return 0;
-
-  while ((*cond)->waiter)
+  waiter = (*cond)->waiter.next;
+  while (waiter != &(*cond)->waiter)
     {
       /* Dequeue the first thread and wake it up.  */
-      thread = (*cond)->waiter;
-      dequeue_thread (thread);
+      dequeue_thread (waiter);
+      thread = (struct npth_impl_s *)waiter;
 
       res = SetEvent (thread->event);
       if (res == 0)
 	/* FIXME: An error here implies a mistake in the npth code.  Log it.  */
 	;
+
+      waiter = (*cond)->waiter.next;
     }
 
   /* Force the woken up threads into the mutex lock function (for the
@@ -1120,7 +1135,6 @@ npth_cond_wait (npth_cond_t *cond, npth_mutex_t *mutex)
   int err2;
   BOOL bres;
   npth_impl_t thread;
-  npth_impl_t *prev_ptr;
 
   /* While we are protected, let's check for a static initializer.  */
   err = cond_init_check (cond);
@@ -1132,18 +1146,14 @@ npth_cond_wait (npth_cond_t *cond, npth_mutex_t *mutex)
     return err;
 
   /* Ensure there is an event.  */
-  if (thread->event == INVALID_HANDLE_VALUE)
+  if (thread->event == NULL)
     {
       thread->event = CreateEvent (NULL, TRUE, FALSE, NULL);
-      if (thread->event == INVALID_HANDLE_VALUE)
+      if (thread->event == NULL)
 	return map_error (GetLastError());
     }
 
-  /* Find end of queue and enqueue the thread.  */
-  prev_ptr = &(*cond)->waiter;
-  while (*prev_ptr)
-    prev_ptr = &(*prev_ptr)->next;
-  enqueue_thread (thread, prev_ptr);
+  enqueue_thread (&thread->l, &(*cond)->waiter);
 
   /* Make sure the event is not signaled before releasing the mutex.  */
   bres = ResetEvent (thread->event);
@@ -1156,7 +1166,7 @@ npth_cond_wait (npth_cond_t *cond, npth_mutex_t *mutex)
       err = npth_mutex_unlock (mutex);
       if (err)
 	{
-	  dequeue_thread (thread);
+	  dequeue_thread (&thread->l);
 	  return err;
 	}
     }
@@ -1166,7 +1176,7 @@ npth_cond_wait (npth_cond_t *cond, npth_mutex_t *mutex)
   LEAVE();
 
   /* Make sure the thread is dequeued (in case of error).  */
-  dequeue_thread (thread);
+  dequeue_thread (&thread->l);
 
   if (mutex)
     {
@@ -1191,7 +1201,6 @@ npth_cond_timedwait (npth_cond_t *cond, npth_mutex_t *mutex,
   int err2;
   BOOL bres;
   npth_impl_t thread;
-  npth_impl_t *prev_ptr;
   DWORD msecs;
 
   err = calculate_timeout (abstime, &msecs);
@@ -1224,10 +1233,10 @@ npth_cond_timedwait (npth_cond_t *cond, npth_mutex_t *mutex,
     return err;
 
   /* Ensure there is an event.  */
-  if (thread->event == INVALID_HANDLE_VALUE)
+  if (thread->event == NULL)
     {
       thread->event = CreateEvent (NULL, TRUE, FALSE, NULL);
-      if (thread->event == INVALID_HANDLE_VALUE)
+      if (thread->event == NULL)
 	return map_error (GetLastError());
     }
 
@@ -1237,16 +1246,12 @@ npth_cond_timedwait (npth_cond_t *cond, npth_mutex_t *mutex,
     /* Log an error.  */
     ;
 
-  /* Find end of queue and enqueue the thread.  */
-  prev_ptr = &(*cond)->waiter;
-  while (*prev_ptr)
-    prev_ptr = &(*prev_ptr)->next;
-  enqueue_thread (thread, prev_ptr);
+  enqueue_thread (&thread->l, &(*cond)->waiter);
 
   err = npth_mutex_unlock (mutex);
   if (err)
     {
-      dequeue_thread (thread);
+      dequeue_thread (&thread->l);
       return err;
     }
 
@@ -1783,7 +1788,7 @@ npth_eselect(int nfd, fd_set *rfds, fd_set *wfds, fd_set *efds,
   int nr_obj = 0;
   /* Number of extra events.  */
   int nr_events = 0;
-  HANDLE sock_event = INVALID_HANDLE_VALUE;
+  HANDLE sock_event = NULL;
   int res;
   DWORD ret;
   SOCKET fd;
@@ -1853,7 +1858,7 @@ npth_eselect(int nfd, fd_set *rfds, fd_set *wfds, fd_set *efds,
      return an error.  */
 
   sock_event = WSACreateEvent ();
-  if (sock_event == INVALID_HANDLE_VALUE)
+  if (sock_event == NULL)
     {
       err = EINVAL;
       return -1;
@@ -1988,7 +1993,7 @@ npth_eselect(int nfd, fd_set *rfds, fd_set *wfds, fd_set *efds,
 
   /* Cleanup.  */
  err_out:
-  if (sock_event != INVALID_HANDLE_VALUE)
+  if (sock_event != NULL)
     {
       for (i = 0; i < nr_fdobj; i++)
 	{
@@ -2003,3 +2008,7 @@ npth_eselect(int nfd, fd_set *rfds, fd_set *wfds, fd_set *efds,
   errno = err;
   return -1;
 }
+
+/* Include that simple function from the Unix version. */
+#include "../src/getversion.c"
+/* end of file */
